@@ -1,0 +1,2 @@
+# HumanActivityRecognition
+LSTM based HAR
