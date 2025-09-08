@@ -175,3 +175,103 @@ def one_hot(y_, n_classes=n_classes):
     
     y_ = y_.reshape(len(y_))
     return np.eye(n_classes)[np.array(y_, dtype=np.int32)]  # Returns FLOATS
+
+
+# Graph input/output
+x = tf.placeholder(tf.float32, [None, n_steps, n_input])
+y = tf.placeholder(tf.float32, [None, n_classes])
+
+# Graph weights
+weights = {
+    'hidden': tf.Variable(tf.random_normal([n_input, n_hidden])), # Hidden layer weights
+    'out': tf.Variable(tf.random_normal([n_hidden, n_classes], mean=1.0))
+}
+biases = {
+    'hidden': tf.Variable(tf.random_normal([n_hidden])),
+    'out': tf.Variable(tf.random_normal([n_classes]))
+}
+
+pred = LSTM_RNN(x, weights, biases)
+
+# Loss, optimizer and evaluation
+l2 = lambda_loss_amount * sum(
+    tf.nn.l2_loss(tf_var) for tf_var in tf.trainable_variables()
+) # L2 loss prevents this overkill neural network to overfit the data
+cost = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y, logits=pred)) + l2 # Softmax loss
+optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(cost) # Adam Optimizer
+
+correct_pred = tf.equal(tf.argmax(pred,1), tf.argmax(y,1))
+accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
+
+
+
+# To keep track of training's performance
+test_losses = []
+test_accuracies = []
+train_losses = []
+train_accuracies = []
+
+# Launch the graph
+sess = tf.InteractiveSession(config=tf.ConfigProto(log_device_placement=True))
+init = tf.global_variables_initializer()
+sess.run(init)
+
+# Perform Training steps with "batch_size" amount of example data at each loop
+step = 1
+while step * batch_size <= training_iters:
+    batch_xs =         extract_batch_size(X_train, step, batch_size)
+    batch_ys = one_hot(extract_batch_size(y_train, step, batch_size))
+
+    # Fit training using batch data
+    _, loss, acc = sess.run(
+        [optimizer, cost, accuracy],
+        feed_dict={
+            x: batch_xs, 
+            y: batch_ys
+        }
+    )
+    train_losses.append(loss)
+    train_accuracies.append(acc)
+    
+    # Evaluate network only at some steps for faster training: 
+    if (step*batch_size % display_iter == 0) or (step == 1) or (step * batch_size > training_iters):
+        
+        # To not spam console, show training accuracy/loss in this "if"
+        print("Training iter #" + str(step*batch_size) + \
+              ":   Batch Loss = " + "{:.6f}".format(loss) + \
+              ", Accuracy = {}".format(acc))
+        
+        # Evaluation on the test set (no learning made here - just evaluation for diagnosis)
+        loss, acc = sess.run(
+            [cost, accuracy], 
+            feed_dict={
+                x: X_test,
+                y: one_hot(y_test)
+            }
+        )
+        test_losses.append(loss)
+        test_accuracies.append(acc)
+        print("PERFORMANCE ON TEST SET: " + \
+              "Batch Loss = {}".format(loss) + \
+              ", Accuracy = {}".format(acc))
+
+    step += 1
+
+print("Optimization Finished!")
+
+# Accuracy for test data
+
+one_hot_predictions, accuracy, final_loss = sess.run(
+    [pred, accuracy, cost],
+    feed_dict={
+        x: X_test,
+        y: one_hot(y_test)
+    }
+)
+
+test_losses.append(final_loss)
+test_accuracies.append(accuracy)
+
+print("FINAL RESULT: " + \
+      "Batch Loss = {}".format(final_loss) + \
+      ", Accuracy = {}".format(accuracy))
