@@ -3,6 +3,12 @@
 # !unzip "UCI HAR Dataset.zip"
 
 import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import tensorflow as tf  # Version 1.0.0 (some previous versions are used in past commits)
+from sklearn import metrics
+
+import os
 # Useful Constants
 
 # Those are separate normalised input features for the neural network
