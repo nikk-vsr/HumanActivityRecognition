@@ -2,16 +2,20 @@
 
 # !unzip "UCI HAR Dataset.zip"
 
-import numpy as np
-import matplotlib
-import matplotlib.pyplot as plt
-import tensorflow as tf  # Version 1.0.0 (some previous versions are used in past commits)
-from sklearn import metrics
+# pytorch_har_lstm.py
 
 import os
-# Useful Constants
+import numpy as np
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import trange
 
-# Those are separate normalised input features for the neural network
+# ---------------------------
+# Dataset / constants (same as original)
+# ---------------------------
+
 INPUT_SIGNAL_TYPES = [
     "body_acc_x_",
     "body_acc_y_",
@@ -24,16 +28,14 @@ INPUT_SIGNAL_TYPES = [
     "total_acc_z_"
 ]
 
-# Output classes to learn how to classify
 LABELS = [
-    "WALKING", 
-    "WALKING_UPSTAIRS", 
-    "WALKING_DOWNSTAIRS", 
-    "SITTING", 
-    "STANDING", 
+    "WALKING",
+    "WALKING_UPSTAIRS",
+    "WALKING_DOWNSTAIRS",
+    "SITTING",
+    "STANDING",
     "LAYING"
 ]
-
 
 TRAIN = "train/"
 TEST = "test/"
@@ -41,19 +43,22 @@ DATASET_PATH = "UCI HAR Dataset/"
 
 def load_X(X_signals_paths):
     X_signals = []
-    
     for signal_type_path in X_signals_paths:
-        file = open(signal_type_path, 'r')
-        # Read dataset from disk, dealing with text files' syntax
-        X_signals.append(
-            [np.array(serie, dtype=np.float32) for serie in [
-                row.replace('  ', ' ').strip().split(' ') for row in file  #splits the numbers between spaces
-            ]]
-        )
-        file.close()
-    
-    return np.transpose(np.array(X_signals), (1, 2, 0)) # prevous 0 1 2 dimension now becomes 1 2 0
-    # desired shape (number of examples, number of time steps, number of input signals).
+        with open(signal_type_path, 'r') as file:
+            # replicate your original parsing behaviour
+            series = [
+                np.array(row.replace('  ', ' ').strip().split(' '), dtype=np.float32)
+                for row in file
+            ]
+        X_signals.append(series)
+    # transpose to shape: (n_examples, n_steps, n_signals)
+    X = np.transpose(np.array(X_signals), (1, 2, 0))
+    return X
+
+def load_y(y_path):
+    with open(y_path, 'r') as file:
+        y_ = np.array([row.replace('  ', ' ').strip().split(' ') for row in file], dtype=np.int32)
+    return (y_ - 1).reshape(-1)  # convert to 0-based vector shape (N,)
 
 X_train_signals_paths = [
     DATASET_PATH + TRAIN + "Inertial Signals/" + signal + "train.txt" for signal in INPUT_SIGNAL_TYPES
@@ -62,222 +67,161 @@ X_test_signals_paths = [
     DATASET_PATH + TEST + "Inertial Signals/" + signal + "test.txt" for signal in INPUT_SIGNAL_TYPES
 ]
 
-X_train = load_X(X_train_signals_paths)
-X_test = load_X(X_test_signals_paths)
-print(X_train_signals_paths)
-
-
-
-def load_y(y_path):
-    file = open(y_path, 'r')
-    # Read dataset from disk, dealing with text file's syntax
-    y_ = np.array(
-        [elem for elem in [
-            row.replace('  ', ' ').strip().split(' ') for row in file
-        ]], 
-        dtype=np.int32
-    )
-    file.close()
-    
-    # Substract 1 to each output class for friendly 0-based indexing 
-    return y_ - 1
-
 y_train_path = DATASET_PATH + TRAIN + "y_train.txt"
 y_test_path = DATASET_PATH + TEST + "y_test.txt"
 
+# load numpy arrays
+X_train = load_X(X_train_signals_paths)
+X_test = load_X(X_test_signals_paths)
 y_train = load_y(y_train_path)
 y_test = load_y(y_test_path)
 
+print("X_train.shape:", X_train.shape)
+print("X_test.shape:", X_test.shape)
+print("y_train.shape:", y_train.shape, "y_test.shape:", y_test.shape)
 
-training_data_count = len(X_train)  # 7352 training series (with 50% overlap between each serie)
-test_data_count = len(X_test)  # 2947 testing series
-n_steps = len(X_train[0])  # 128 timesteps per series
-n_input = len(X_train[0][0])  # 9 input parameters per timestep
+training_data_count = len(X_train)  # 7352
+test_data_count = len(X_test)       # 2947
+n_steps = X_train.shape[1]          # 128
+n_input = X_train.shape[2]          # 9
 
-
-print(X_train.shape)  #128 timesteps is already given in the data file # 50% overlap is there between sequence to sequence
-print(X_train[0].shape)
-print(X_train[0][0])
-
-
-# LSTM Neural Network's internal structure
-
-n_hidden = 32 # Hidden layer num of features
-n_classes = 6 # Total classes (should go up, or should go down)
-
-
-# Training 
+# ---------------------------
+# Hyperparameters (matched)
+# ---------------------------
+n_hidden = 32
+n_classes = 6
 
 learning_rate = 0.0025
-lambda_loss_amount = 0.0015
-training_iters = training_data_count * 300  # Loop 300 times on the dataset
+lambda_loss_amount = 0.0015   # used with tf.nn.l2_loss semantics: 0.5 * sum(param^2)
+epochs = 300                  # original TF ran data*300 iterations; we run 300 passes as equivalent
 batch_size = 1500
-display_iter = 30000  # To show test set accuracy during training
+display_iter = 30000          # used similarly for printing frequency
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 
-# Some debugging info
+# ---------------------------
+# Model (input linear + ReLU -> 2-layer LSTM -> final FC)
+# ---------------------------
+class HARLSTM(nn.Module):
+    def __init__(self, n_input, n_hidden, n_classes, n_layers=2):
+        super(HARLSTM, self).__init__()
+        self.input_linear = nn.Linear(n_input, n_hidden)   # matches tf weights['hidden']
+        self.relu = nn.ReLU()
+        self.lstm = nn.LSTM(input_size=n_hidden, hidden_size=n_hidden,
+                            num_layers=n_layers, batch_first=True)
+        self.out = nn.Linear(n_hidden, n_classes)
 
-print("Some useful info to get an insight on dataset's shape and normalisation:")
-print("(X shape, y shape, every X's mean, every X's standard deviation)")
-print(X_test.shape, y_test.shape, np.mean(X_test), np.std(X_test))
-print("The dataset is therefore properly normalised, as expected, but not yet one-hot encoded.")
+    def forward(self, x):
+        # x: (batch, time, features)
+        b, t, f = x.size()
+        # apply input linear per-timestep
+        x_flat = x.view(b * t, f)                # (b*t, n_input)
+        h = self.relu(self.input_linear(x_flat)) # (b*t, n_hidden)
+        h = h.view(b, t, -1)                     # (b, t, n_hidden)
+        out_seq, (hn, cn) = self.lstm(h)         # out_seq: (b, t, n_hidden)
+        last = out_seq[:, -1, :]                 # (b, n_hidden)
+        logits = self.out(last)                  # (b, n_classes)
+        return logits
 
+model = HARLSTM(n_input, n_hidden, n_classes, n_layers=2).to(device)
 
+# ---------------------------
+# Loss, optimizer (we will add L2 as extra term like TF)
+# ---------------------------
+criterion = nn.CrossEntropyLoss()  # takes class indices
 
-def LSTM_RNN(_X, _weights, _biases):
-    # Function returns a tensorflow LSTM (RNN) artificial neural network from given parameters. 
-    # Moreover, two LSTM cells are stacked which adds deepness to the neural network. 
-    # Note, some code of this notebook is inspired from an slightly different 
-    # RNN architecture used on another dataset, some of the credits goes to 
-    # "aymericdamien" under the MIT license.
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    # (NOTE: This step could be greatly optimised by shaping the dataset once
-    # input shape: (batch_size, n_steps, n_input)
-    _X = tf.transpose(_X, [1, 0, 2])  # permute n_steps and batch_size
-    # Reshape to prepare input to hidden activation
-    _X = tf.reshape(_X, [-1, n_input]) 
-    # new shape: (n_steps*batch_size, n_input)
-    
-    _X = tf.nn.relu(tf.matmul(_X, _weights['hidden']) + _biases['hidden'])          # 
-    # Split data because rnn cell needs a list of inputs for the RNN inner loop
-    _X = tf.split(_X, n_steps, 0) 
-    # new shape: n_steps * (batch_size, n_hidden)
+# ---------------------------
+# Helper: l2 term like TF's lambda * sum(tf.nn.l2_loss(var))
+# tf.nn.l2_loss(var) == sum(var**2) / 2
+# So L2_term = lambda_loss_amount * 0.5 * sum(var**2)
+# ---------------------------
+def l2_regularization(model):
+    l2 = 0.0
+    for p in model.parameters():
+        l2 = l2 + torch.sum(p.pow(2))
+    return 0.5 * l2 * lambda_loss_amount
 
-    # Define two stacked LSTM cells (two recurrent layers deep) with tensorflow
-    lstm_cell_1 = tf.contrib.rnn.BasicLSTMCell(n_hidden, forget_bias=1.0, state_is_tuple=True)
-    lstm_cell_2 = tf.contrib.rnn.BasicLSTMCell(n_hidden, forget_bias=1.0, state_is_tuple=True)
-    lstm_cells = tf.contrib.rnn.MultiRNNCell([lstm_cell_1, lstm_cell_2], state_is_tuple=True)
-    # Get LSTM cell output
-    outputs, states = tf.contrib.rnn.static_rnn(lstm_cells, _X, dtype=tf.float32)
-
-    # Get last time step's output feature for a "many-to-one" style classifier, 
-    # as in the image describing RNNs at the top of this page
-    lstm_last_output = outputs[-1]
-    
-    # Linear activation
-    return tf.matmul(lstm_last_output, _weights['out']) + _biases['out']
-
-
-def extract_batch_size(_train, step, batch_size):
-    # Function to fetch a "batch_size" amount of data from "(X|y)_train" data. 
-    
-    shape = list(_train.shape)
+# ---------------------------
+# Batch extraction that replicates original 'extract_batch_size' cycling logic
+# (deterministic sequence, wraps around with modulo)
+# ---------------------------
+def extract_batch(X, y, global_step, batch_size):
+    shape = list(X.shape)
     shape[0] = batch_size
-    batch_s = np.empty(shape)
-
+    batch = np.empty(shape, dtype=np.float32)
+    batch_y = np.empty((batch_size,), dtype=np.int64)
+    total = len(X)
     for i in range(batch_size):
-        # Loop index
-        index = ((step-1)*batch_size + i) % len(_train)
-        batch_s[i] = _train[index] 
+        index = ((global_step - 1) * batch_size + i) % total
+        batch[i] = X[index]
+        batch_y[i] = y[index]
+    return batch, batch_y
 
-    return batch_s
-
-
-def one_hot(y_, n_classes=n_classes):
-    # Function to encode neural one-hot output labels from number indexes 
-    # e.g.: 
-    # one_hot(y_=[[5], [0], [3]], n_classes=6):
-    #     return [[0, 0, 0, 0, 0, 1], [1, 0, 0, 0, 0, 0], [0, 0, 0, 1, 0, 0]]
-    
-    y_ = y_.reshape(len(y_))
-    return np.eye(n_classes)[np.array(y_, dtype=np.int32)]  # Returns FLOATS
-
-
-# Graph input/output
-x = tf.placeholder(tf.float32, [None, n_steps, n_input])
-y = tf.placeholder(tf.float32, [None, n_classes])
-
-# Graph weights
-weights = {
-    'hidden': tf.Variable(tf.random_normal([n_input, n_hidden])), # Hidden layer weights
-    'out': tf.Variable(tf.random_normal([n_hidden, n_classes], mean=1.0))
-}
-biases = {
-    'hidden': tf.Variable(tf.random_normal([n_hidden])),
-    'out': tf.Variable(tf.random_normal([n_classes]))
-}
-
-pred = LSTM_RNN(x, weights, biases)
-
-# Loss, optimizer and evaluation
-l2 = lambda_loss_amount * sum(
-    tf.nn.l2_loss(tf_var) for tf_var in tf.trainable_variables()
-) # L2 loss prevents this overkill neural network to overfit the data
-cost = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y, logits=pred)) + l2 # Softmax loss
-optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(cost) # Adam Optimizer
-
-correct_pred = tf.equal(tf.argmax(pred,1), tf.argmax(y,1))
-accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
-
-
-
-# To keep track of training's performance
-test_losses = []
-test_accuracies = []
+# ---------------------------
+# Training loop (mimics behaviour from original TF code)
+# ---------------------------
 train_losses = []
 train_accuracies = []
+test_losses = []
+test_accuracies = []
 
-# Launch the graph
-sess = tf.InteractiveSession(config=tf.ConfigProto(log_device_placement=True))
-init = tf.global_variables_initializer()
-sess.run(init)
+# Pre-convert test set to tensors for faster evaluation
+X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+y_test_t = torch.tensor(y_test, dtype=torch.long).to(device)
 
-# Perform Training steps with "batch_size" amount of example data at each loop
 step = 1
-while step * batch_size <= training_iters:
-    batch_xs =         extract_batch_size(X_train, step, batch_size)
-    batch_ys = one_hot(extract_batch_size(y_train, step, batch_size))
+max_steps = math.ceil((training_data_count * epochs) / batch_size)
+print("Total training steps (approx):", max_steps)
 
-    # Fit training using batch data
-    _, loss, acc = sess.run(
-        [optimizer, cost, accuracy],
-        feed_dict={
-            x: batch_xs, 
-            y: batch_ys
-        }
-    )
-    train_losses.append(loss)
+# We will iterate until step > max_steps similar to TF while loop
+while step <= max_steps:
+    batch_x_np, batch_y_np = extract_batch(X_train, y_train, step, batch_size)
+    batch_x = torch.tensor(batch_x_np, dtype=torch.float32).to(device)
+    batch_y = torch.tensor(batch_y_np, dtype=torch.long).to(device)
+
+    model.train()
+    optimizer.zero_grad()
+    logits = model(batch_x)                     # (batch, n_classes)
+    loss = criterion(logits, batch_y) + l2_regularization(model)
+    loss.backward()
+    optimizer.step()
+
+    # training accuracy for this batch
+    preds = torch.argmax(logits, dim=1)
+    acc = (preds == batch_y).float().mean().item()
+
+    train_losses.append(loss.item())
     train_accuracies.append(acc)
-    
-    # Evaluate network only at some steps for faster training: 
-    if (step*batch_size % display_iter == 0) or (step == 1) or (step * batch_size > training_iters):
-        
-        # To not spam console, show training accuracy/loss in this "if"
-        print("Training iter #" + str(step*batch_size) + \
-              ":   Batch Loss = " + "{:.6f}".format(loss) + \
-              ", Accuracy = {}".format(acc))
-        
-        # Evaluation on the test set (no learning made here - just evaluation for diagnosis)
-        loss, acc = sess.run(
-            [cost, accuracy], 
-            feed_dict={
-                x: X_test,
-                y: one_hot(y_test)
-            }
-        )
-        test_losses.append(loss)
-        test_accuracies.append(acc)
-        print("PERFORMANCE ON TEST SET: " + \
-              "Batch Loss = {}".format(loss) + \
-              ", Accuracy = {}".format(acc))
+
+    # printing / test eval conditions (mimic original conditions)
+    if (step == 1) or ((step * batch_size) % display_iter == 0) or (step >= max_steps):
+        print(f"Training iter #{step*batch_size}:   Batch Loss = {loss.item():.6f}, Accuracy = {acc:.6f}")
+
+        # Evaluate on test set
+        model.eval()
+        with torch.no_grad():
+            test_logits = model(X_test_t)
+            test_loss = criterion(test_logits, y_test_t) + l2_regularization(model)
+            test_preds = torch.argmax(test_logits, dim=1)
+            test_acc = (test_preds == y_test_t).float().mean().item()
+
+        test_losses.append(test_loss.item())
+        test_accuracies.append(test_acc)
+        print(f"PERFORMANCE ON TEST SET: Batch Loss = {test_loss.item():.6f}, Accuracy = {test_acc:.6f}")
 
     step += 1
 
 print("Optimization Finished!")
 
-# Accuracy for test data
+# final test evaluation (same as TF final)
+model.eval()
+with torch.no_grad():
+    final_logits = model(X_test_t)
+    final_loss = criterion(final_logits, y_test_t) + l2_regularization(model)
+    final_preds = torch.argmax(final_logits, dim=1)
+    final_acc = (final_preds == y_test_t).float().mean().item()
 
-one_hot_predictions, accuracy, final_loss = sess.run(
-    [pred, accuracy, cost],
-    feed_dict={
-        x: X_test,
-        y: one_hot(y_test)
-    }
-)
-
-test_losses.append(final_loss)
-test_accuracies.append(accuracy)
-
-print("FINAL RESULT: " + \
-      "Batch Loss = {}".format(final_loss) + \
-      ", Accuracy = {}".format(accuracy))
+print("FINAL RESULT: Batch Loss = {:.6f}, Accuracy = {:.6f}".format(final_loss.item(), final_acc))
