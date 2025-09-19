@@ -106,7 +106,7 @@ print("Using device:", device)
 class HARLSTM(nn.Module):
     def __init__(self, n_input, n_hidden, n_classes, n_layers=2):
         super(HARLSTM, self).__init__()
-        self.input_linear = nn.Linear(n_input, n_hidden)   # matches tf weights['hidden']
+        self.input_linear = nn.Linear(n_input, n_hidden)   # matches tf weights['hidden'] # applies transformation to input vector independently, i.e. for each time step
         self.relu = nn.ReLU()
         self.lstm = nn.LSTM(input_size=n_hidden, hidden_size=n_hidden,
                             num_layers=n_layers, batch_first=True)
@@ -227,30 +227,71 @@ with torch.no_grad():
 print("FINAL RESULT: Batch Loss = {:.6f}, Accuracy = {:.6f}".format(final_loss.item(), final_acc))
 
 
-# Results
+# ---------------------------
+# Plotting & metrics (uses recorded step indices)
+# ---------------------------
 
-predictions = one_hot_predictions.argmax(1)
+import matplotlib
+import matplotlib.pyplot as plt
+from sklearn import metrics
+import numpy as np
 
-print("Testing Accuracy: {}%".format(100*accuracy))
+# If running in a notebook:
+# %matplotlib inline
 
+# Matplotlib font/style matching your snippet
+plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.weight': 'bold', 'font.size': 18})
+
+
+# === Plot training progress using the recorded step indices ===
+width = 12
+height = 12
+plt.figure(figsize=(width, height))
+
+# train_steps/train_losses and train_accuracies have same length
+plt.plot(np.array(train_steps), np.array(train_losses),     "b--", label="Train losses")
+plt.plot(np.array(train_steps), np.array(train_accuracies), "g--", label="Train accuracies")
+
+# test_steps/test_losses and test_accuracies have same length (fewer points)
+if len(test_steps) > 0:
+    plt.plot(np.array(test_steps), np.array(test_losses),     "b-", label="Test losses")
+    plt.plot(np.array(test_steps), np.array(test_accuracies), "g-", label="Test accuracies")
+
+plt.title("Training session's progress over iterations")
+plt.legend(loc='upper right', shadow=True)
+plt.ylabel('Training Progress (Loss or Accuracy values)')
+plt.xlabel('Training iteration')
+plt.show()
+
+# === Final predictions & classification metrics exactly like original ===
+final_logits_cpu = final_logits.detach().cpu().numpy()   # shape (n_test, n_classes)
+predictions = np.argmax(final_logits_cpu, axis=1)       # shape (n_test,)
+
+y_true = np.array(y_test).reshape(-1)
+
+accuracy_float = 100.0 * metrics.accuracy_score(y_true, predictions)
+print("Testing Accuracy: {:.2f}%".format(accuracy_float))
 print("")
-print("Precision: {}%".format(100*metrics.precision_score(y_test, predictions, average="weighted")))
-print("Recall: {}%".format(100*metrics.recall_score(y_test, predictions, average="weighted")))
-print("f1_score: {}%".format(100*metrics.f1_score(y_test, predictions, average="weighted")))
+print("Precision: {:.2f}%".format(100.0 * metrics.precision_score(y_true, predictions, average="weighted")))
+print("Recall: {:.2f}%".format(100.0 * metrics.recall_score(y_true, predictions, average="weighted")))
+print("F1 score: {:.2f}%".format(100.0 * metrics.f1_score(y_true, predictions, average="weighted")))
 
+# Confusion matrix (counts)
 print("")
 print("Confusion Matrix:")
-confusion_matrix = metrics.confusion_matrix(y_test, predictions)
+confusion_matrix = metrics.confusion_matrix(y_true, predictions)
 print(confusion_matrix)
-normalised_confusion_matrix = np.array(confusion_matrix, dtype=np.float32)/np.sum(confusion_matrix)*100
+
+# Normalise to % of total test data (same as your TF code)
+normalised_confusion_matrix = np.array(confusion_matrix, dtype=np.float32) / np.sum(confusion_matrix) * 100.0
 
 print("")
 print("Confusion matrix (normalised to % of total test data):")
 print(normalised_confusion_matrix)
-print("Note: training and testing data is not equally distributed amongst classes, ")
-print("so it is normal that more than a 6th of the data is correctly classifier in the last category.")
+print("Note: training and testing data is not equally distributed amongst classes,")
+print("so it is normal that more than a 6th of the data is correctly classified in a single category.")
 
-# Plot Results:
+# Plot normalised confusion matrix
 width = 12
 height = 12
 plt.figure(figsize=(width, height))
